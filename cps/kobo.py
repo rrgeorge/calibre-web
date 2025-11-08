@@ -25,6 +25,8 @@ import zipfile
 from time import gmtime, strftime
 import json
 from urllib.parse import unquote
+from urllib.parse import urlparse
+from urllib.parse import parse_qs
 
 from flask import (
     Blueprint,
@@ -358,9 +360,12 @@ def get_download_url_for_book(book_id, book_format):
             host = "".join(request.host.split(':')[:-1])
         else:
             host = request.host
-
+        if "X-Forwarded-Proto" in request.headers:
+            scheme = request.headers["X-Forwarded-Proto"]
+        else:
+            scheme = request.scheme
         return "{url_scheme}://{url_base}:{url_port}/kobo/{auth_token}/download/{book_id}/{book_format}".format(
-            url_scheme=request.scheme,
+            url_scheme=scheme,
             url_base=host,
             url_port=config.config_external_port,
             auth_token=get_auth_token(),
@@ -962,6 +967,9 @@ def HandleBookDeletionRequest(book_uuid):
 @csrf.exempt
 @kobo.route("/v1/library/<dummy>", methods=["DELETE", "GET", "POST"])
 @kobo.route("/v1/library/<dummy>/preview", methods=["POST"])
+@kobo.route("/v1/categories/<dummy>", methods=["GET", "POST"])
+@kobo.route("/v1/categories/<dummy>/featured", methods=["GET", "POST"])
+@kobo.route("/v1/categories/<dummy>/products", methods=["GET", "POST"])
 def HandleUnimplementedRequest(dummy=None):
     log.debug("Unimplemented Library Request received: %s (request is forwarded to kobo if configured)",
               request.base_url)
@@ -1005,6 +1013,74 @@ def handle_getests():
 @kobo.route("/v1/products/<dummy>/recommendations", methods=["GET", "POST"])
 @kobo.route("/v1/products/<dummy>/nextread", methods=["GET", "POST"])
 @kobo.route("/v1/products/<dummy>/reviews", methods=["GET", "POST"])
+@kobo.route("/v1/user/reviews", methods=["GET", "POST"])
+#http://books.luxorhodde.net/kobo/c0f232f5826208f9fb2f51886f1b492f/v1/user/reviews?ProductIds=f76badd7-3cd9-45fc-9b1f-e2cf3c39616f
+def HandleBookProductRequest(dummy=None):
+    parsed_url = urlparse(request.url)
+    params = parse_qs(parsed_url.query)
+    if 'ProductIds' in params:
+        dummy = params['ProductIds'][0]
+        if ',' in dummy:
+            dummy = dummy.split(',')[0]
+    kobo_id = None
+    book_uuid = dummy
+    book = calibre_db.get_book_by_uuid(book_uuid)
+    query = []
+    if not book or not book.data:
+        log.info("Book %s not found in database", book_uuid)
+        return redirect_or_proxy_request()
+    log.debug(book.identifiers)
+    for i in book.identifiers:
+        log.debug("ID %s",i)
+        if i.type == "isbn":
+            query.append(i.val)
+    
+    if book.title:
+        query.append(book.title)
+
+    authors = get_author(book)
+    for author in authors["Contributors"]:
+        query.append(author)
+
+
+    outgoing_headers = Headers(request.headers)
+    outgoing_headers.remove("Host")
+
+    search_url = "{products_url}?q={query}&PageIndex=0&PageSize=20&Filters=%7B%7D".format(
+            products_url=NATIVE_KOBO_RESOURCES()["productsv2"],
+            query="%20".join(query)
+            )
+
+    store_response = requests.request(
+        method="GET",
+        url=search_url,
+        headers=outgoing_headers,
+        data=request.get_data(),
+        allow_redirects=False,
+        timeout=(2, 10)
+    )
+    search_result = store_response.json()
+    log.debug("StatusCode: " + str(store_response.status_code))
+    for item in search_result['Items']:
+        if 'Book' not in item:
+            continue
+        log.debug("Result: %s, %s, %s", item['Book']['Id'], item['Book']['Title'], item['Book']['Contributors'])
+        if item['Book']['Title'] == book.title:
+            kobo_id = item['Book']['Id']
+            break
+    if not kobo_id:
+        log.debug("Unimplemented Products Request received: %s (request is forwarded to kobo if configured) no match",
+                  request.base_url)
+        return redirect_or_proxy_request()
+
+    log.debug("Book UUID=%s. Needs to be %s",dummy,kobo_id)
+    log.debug("Redirecting Products Recommendations Request received: %s (request is forwarded to kobo if configured)",
+              request.base_url)
+    store_url = get_store_url_for_current_request().replace(book_uuid,kobo_id)
+    return redirect(store_url, 307)
+    #return redirect_or_proxy_request()
+
+@csrf.exempt
 @kobo.route("/v1/products/featured/<dummy>", methods=["GET", "POST"])
 @kobo.route("/v1/products/featured/", methods=["GET", "POST"])
 @kobo.route("/v1/products/books/external/<dummy>", methods=["GET", "POST"])
@@ -1014,6 +1090,8 @@ def handle_getests():
 @kobo.route("/v1/products/dailydeal", methods=["GET", "POST"])
 @kobo.route("/v1/products/deals", methods=["GET", "POST"])
 @kobo.route("/v1/products", methods=["GET", "POST"])
+@kobo.route("/v1/products/<path:dummy>", methods=["GET", "POST"])
+@kobo.route("/v1/products/<path:dummy>/", methods=["GET", "POST"])
 @kobo.route("/v1/affiliate", methods=["GET", "POST"])
 @kobo.route("/v1/deals", methods=["GET", "POST"])
 def HandleProductsRequest(dummy=None):
@@ -1077,8 +1155,12 @@ def HandleInitRequest():
             host = "".join(request.host.split(':')[:-1])
         else:
             host = request.host
+        if "X-Forwarded-Proto" in request.headers:
+            scheme = request.headers["X-Forwarded-Proto"]
+        else:
+            scheme = request.scheme
         calibre_web_url = "{url_scheme}://{url_base}:{url_port}".format(
-            url_scheme=request.scheme,
+            url_scheme=scheme,
             url_base=host,
             url_port=config.config_external_port
         )
